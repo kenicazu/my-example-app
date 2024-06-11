@@ -1,0 +1,188 @@
+stages:
+- test
+
+variables:
+  CHECKOV_VERSION: 2.3.245
+  GL_ASDF_TFLINT_VERSION: 0.46.1
+  GL_ASDF_TERRAFORM_VERSION: 1.4.2
+  GL_COMMON_CI_TASKS_DEFAULT_GITLEAKS_VERSION: 8.16.3
+  GL_ASDF_GOLANG_VERSION: 1.20.4
+  GL_ASDF_GOLANGCI_LINT_VERSION: 1.52.2
+
+tflint:
+  stage: test
+  image:
+    name: registry.gitlab.com/gitlab-com/gl-infra/common-ci-tasks-images/tflint:${GL_ASDF_TFLINT_VERSION}
+    entrypoint: [""]
+  script:
+    - rm -rf "tflint-reports/"
+    - mkdir -p "tflint-reports/"
+    # Find all TF files and lint the directories of those files
+    - tflint --init -c .tflint.hcl
+    # Loop through all the directories containing *.tf files and run tflint in them
+    - find . -type f -name '*.tf' | grep -vE "${COMMON_TASK_VALIDATIONS_EXCLUDES_REGEXP:-__ignored__}" | sed -e 's#/[^/]*$##' | sort -u | grep -v "${TFLINT_EXCLUDE_REGEX:-__ignored__}" | while read -r dir; do
+        junit_file="$(echo "$dir"|sed -r 's/[^a-zA-Z0-9]+/-/g' | sed -r s/^-+\|-+$//g).xml";
+        echo "${dir} -------------------------------------------------------";
+        cd "${CI_PROJECT_DIR}/${dir}" || exit 1;
+        tflint -c "${CI_PROJECT_DIR}/.tflint.hcl" -f compact || echo "${dir}" >> "${CI_PROJECT_DIR}/tflint-reports/failed";
+        tflint -c "${CI_PROJECT_DIR}/.tflint.hcl" -f junit > "${CI_PROJECT_DIR}/tflint-reports/${junit_file}" || true;
+      done;
+    # tflint-reports/failed indicates a linter failure
+    - if [ -f "${CI_PROJECT_DIR}/tflint-reports/failed" ]; then
+        echo "Failures found in:";
+        cat "${CI_PROJECT_DIR}/tflint-reports/failed";
+        exit 1;
+      fi
+  after_script:
+    - |
+      cat <<-EOD
+      ----------------------------------------------------------
+      Need help? Documentation on the tflint CI job can be found at:
+      https://gitlab.com/gitlab-com/gl-infra/common-ci-tasks/-/blob/main/tflint.md
+      EOD
+  artifacts:
+    when: always
+    reports:
+      junit: tflint-reports/*.xml
+  rules:
+    - changes:
+        - "**/*.tf*"
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"'
+
+checkov:
+  stage: test
+  needs: []
+  image:
+    name: bridgecrew/checkov:${CHECKOV_VERSION}
+    entrypoint: [""]
+  script:
+    - checkov --config-file .checkov.yaml
+  artifacts:
+    when: always
+    reports:
+      junit: "checkov-output/results_junitxml.xml"
+    paths:
+      - "checkov-output/*"
+  rules:
+    - changes:
+        - "**/*.tf*"
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"'
+  # Automatically retry on any system blips
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+
+terraform_format:
+  stage: test
+  needs: []
+  image:
+    name: hashicorp/terraform:${GL_ASDF_TERRAFORM_VERSION}
+    entrypoint: [""]
+  script:
+    - terraform fmt -recursive -diff -check .
+  after_script:
+    - |
+      cat <<-EOD
+      ----------------------------------------------------------
+      Need help? Documentation on the terraform_format CI job can be found at:
+      https://gitlab.com/gitlab-com/gl-infra/common-ci-tasks/-/blob/main/terraform-format.md
+      EOD
+  rules:
+    - changes:
+        - "**/*.tf*"
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"'
+
+terraform_validate:
+  stage: test
+  needs: []
+  image:
+    name: hashicorp/terraform:${GL_ASDF_TERRAFORM_VERSION}
+    entrypoint: [""]
+  script:
+    # Loop through all the directories containing *.tf files and run terraform validate in them
+    - find . -type f -name '*.tf' | grep -vE "${COMMON_TASK_VALIDATIONS_EXCLUDES_REGEXP:-__ignored__}" | sed -e 's#/[^/]*$##' | sort -u | grep -v "${TFLINT_EXCLUDE_REGEX:-__ignored__}" | while read -r dir; do
+        echo "${dir} -------------------------------------------------------";
+        cd "${CI_PROJECT_DIR}/${dir}" || exit 1;
+        terraform init -backend=false -reconfigure;
+        terraform validate || touch "${CI_PROJECT_DIR}/tf-validate-failed";
+      done;
+    # tf-validate-failed indicates a linter failure
+    - if [ -f "${CI_PROJECT_DIR}/tf-validate-failed" ]; then exit 1; fi
+  after_script:
+    - |
+      cat <<-EOD
+      ----------------------------------------------------------
+      Need help? Documentation on the terraform_validate CI job can be found at:
+      https://gitlab.com/gitlab-com/gl-infra/common-ci-tasks/-/blob/main/terraform-validate.md
+      EOD
+  rules:
+    - changes:
+        - "**/*.tf*"
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"'
+
+gitleaks:
+  stage: test
+  needs: []
+  image:
+    name: docker.io/zricethezav/gitleaks:v${GL_COMMON_CI_TASKS_DEFAULT_GITLEAKS_VERSION}
+    entrypoint: [""]
+
+  # Being impacted by https://gitlab.com/gitlab-org/gitlab/-/issues/350100
+  # This workaround has been applied:
+  # https://gitlab.com/gitlab-org/gitlab/-/issues/350100#note_899547344
+  variables:
+    GIT_STRATEGY: clone # clone entire repo instead of reusing workspace
+    GIT_DEPTH: 0 # avoid shallow clone
+
+  script:
+    - gitleaks detect
+        --redact
+        --report-format json
+        --verbose
+        --log-level debug
+        --log-opts="origin/${CI_DEFAULT_BRANCH}.."
+  after_script:
+    - |
+      cat <<-EOD
+      ----------------------------------------------------------
+      Need help? Documentation on the gitleaks CI job can be found at:
+      https://gitlab.com/gitlab-com/gl-infra/common-ci-tasks/-/blob/main/gitleaks.md
+      EOD
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists:
+        - .gitleaks.toml
+  # Automatically retry on any system blips
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+
+editorconfig_check:
+  stage: test
+  image:
+    name: mstruebing/editorconfig-checker
+    entrypoint: []
+  needs: []
+  script:
+    - ec
+  after_script:
+    - |
+      cat <<-EOD
+      ----------------------------------------------------------
+      Need help? Documentation on the editorconfig_check CI job can be found at:
+      https://gitlab.com/gitlab-com/gl-infra/common-ci-tasks/-/blob/main/editorconfig-check.md
+      EOD
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"'
+  # Automatically retry on any system blips
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
